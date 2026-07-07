@@ -279,13 +279,12 @@ def build_record(filename: str, data: bytes, employee_map: Optional[Dict[str, di
     subgroup = employee.get('subgroup') or subgroup_from_pdf
     cpf = employee.get('cpf') or cpf_pdf
 
-    included = True
+        included = True
     reason = 'OK'
 
     if status == 'Demitido':
-        included = False
-        reason = 'Ignorado por situação 8 (Demitido)'
-    elif not cpf:
+        reason = 'Situação 8 (Demitido) - renomeado normalmente'
+    if not cpf:
         included = False
         reason = 'CPF não encontrado no PDF nem na planilha'
     elif period == 'SEM_PERIODO':
