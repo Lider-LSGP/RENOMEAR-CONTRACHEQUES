@@ -37,7 +37,7 @@ with hero_left:
         """
         <div class="hero">
             <h1>Renomeador de Contracheques - Domínio</h1>
-            <p>Processamento otimizado para lotes grandes: mantém o resultado em memória da sessão para o download não se perder ao clicar.</p>
+            <p>Identifica empresa pelo CNPJ do PDF, renomeia demitidos normalmente e separa a ATIVA por PMV, SEDU e GERAL.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -48,11 +48,11 @@ with hero_right:
 
 info1, info2, info3 = st.columns(3)
 with info1:
-    st.markdown('<div class="card"><h4>Download estável</h4><div class="mini">Os arquivos gerados ficam salvos na sessão. Clicar em baixar não força novo processamento.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h4>Empresa pelo PDF</h4><div class="mini">A empresa é identificada pelo CNPJ dentro do PDF, evitando erros quando o mesmo código existe em empresas diferentes.</div></div>', unsafe_allow_html=True)
 with info2:
-    st.markdown('<div class="card"><h4>Lotes grandes</h4><div class="mini">Você pode gerar só o ZIP separado, só o geral, ou os dois. Isso reduz tempo e memória.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h4>Demitidos incluídos</h4><div class="mini">Contracheques de situação 8 (Demitido) também são renomeados e entram nas pastas normalmente.</div></div>', unsafe_allow_html=True)
 with info3:
-    st.markdown('<div class="card"><h4>Planilha opcional</h4><div class="mini">Sem planilha o app lê CPF do PDF. Com planilha, aplica a regra de situação 8 = demitido.</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="card"><h4>Lotes grandes</h4><div class="mini">Você pode gerar só o ZIP separado, só o geral, ou os dois. O resultado fica salvo na sessão para o download não recarregar tudo.</div></div>', unsafe_allow_html=True)
 
 aba_processar, aba_regras = st.tabs(['Processar arquivos', 'Regras do app'])
 
@@ -62,7 +62,7 @@ with aba_processar:
         planilha = st.file_uploader(
             'Planilha da Domínio (.xls/.xlsx) - opcional',
             type=['xls', 'xlsx'],
-            help='Se enviada, será usada para validar situação e complementar CPF/empresa/posto.',
+            help='Se enviada, o CPF vem direto da planilha (mais confiável). Sem planilha, o CPF é lido do PDF quando possível.',
         )
     with col2:
         pdf_uploads = st.file_uploader(
@@ -84,8 +84,8 @@ with aba_processar:
         ' '.join([
             '<span class="pill">Renomeia para MM-AAAA-CPF.pdf</span>',
             '<span class="pill">ATIVA → PMV / SEDU / GERAL</span>',
-            '<span class="pill">Download sem rerun</span>',
-            '<span class="pill">Prévia opcional</span>',
+            '<span class="pill">Demitidos renomeados</span>',
+            '<span class="pill">Empresa pelo CNPJ do PDF</span>',
         ]),
         unsafe_allow_html=True,
     )
@@ -141,18 +141,19 @@ with aba_processar:
         mostrar_previa = resultado['mostrar_previa']
 
         if planilha_ok:
-            st.markdown('<div class="success-box"><strong>Modo usado:</strong> PDF + planilha. Situação 8 será ignorada automaticamente.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="success-box"><strong>Modo usado:</strong> PDF + planilha. Contracheques de demitidos (situação 8) também são renomeados normalmente.</div>', unsafe_allow_html=True)
         else:
-            st.markdown('<div class="success-box"><strong>Modo usado:</strong> somente PDF. O app pegou o CPF diretamente do contracheque. Sem planilha, a regra de ignorar situação 8 não pode ser aplicada.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="success-box"><strong>Modo usado:</strong> somente PDF. O CPF vem direto do contracheque.</div>', unsafe_allow_html=True)
 
         if resultado['zip_all'] is not None and resultado['zip_sep'] is not None:
             st.markdown('<div class="warn-box"><strong>Dica de desempenho:</strong> para lotes muito grandes, use primeiro só o ZIP separado por empresa. O ZIP geral costuma ser a segunda saída mais pesada.</div>', unsafe_allow_html=True)
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric('Arquivos lidos', summary['total'])
         m2.metric('Incluídos', summary['incluidos'])
         m3.metric('Ignorados', summary['ignorados'])
-        m4.metric('Período', summary['periodo'])
+        m4.metric('Demitidos renomeados', summary.get('demitidos_renomeados', 0))
+        m5.metric('Período', summary['periodo'])
 
         st.subheader('Resumo por empresa')
         if summary['empresas']:
@@ -216,17 +217,22 @@ with aba_processar:
 with aba_regras:
     st.markdown(
         """
-        ### O que foi otimizado nesta versão
-        - O resultado fica guardado na sessão após o processamento.
-        - O clique em **baixar** não deve refazer tudo.
-        - Você pode gerar **só o ZIP separado**, **só o geral** ou ambos.
-        - A prévia completa pode ficar desligada para lotes grandes.
+        ### O que mudou nesta versão
+        - A **empresa** de cada PDF agora é identificada pelo **CNPJ dentro do arquivo**, não pelo nome do arquivo.
+          Isso evita colocar contracheques de uma empresa na pasta de outra quando o código do empregado se repete.
+        - **Situação 8 (Demitido)** deixou de ser ignorada. Esses contracheques são **renomeados normalmente** e vão para as pastas das suas empresas.
+        - O lookup na planilha usa a chave composta **(codi_emp, código)**, corrigindo o CPF que podia sair errado antes.
+        - Detecção de **PMV** e **SEDU** ficou mais robusta.
 
         ### Regras do app
         - **Sem planilha:** tenta encontrar **CPF**, **empresa** e **mês/ano** dentro do próprio PDF.
-        - **Com planilha:** usa a planilha para complementar dados e aplicar a regra de situação.
-        - **Situação 8:** ignorado automaticamente **somente quando a planilha é enviada**.
+        - **Com planilha:** usa a planilha para pegar o CPF correto e apresentar a situação de cada colaborador.
         - **ATIVA:** organiza em subpastas **PMV**, **SEDU** e **GERAL**.
         - **Nome final:** `MM-AAAA-CPF.pdf`
+
+        ### CNPJs configurados
+        - **ATIVA:** 02.201.230/0001-44
+        - **LIDER COMERCIAL:** 03.659.631/0001-05
+        - LIDER MULTISSERVICOS e VSP identificadas pelo nome no PDF. Basta acrescentar os CNPJs no `processor.py` para ganhar ainda mais precisão.
         """
     )
