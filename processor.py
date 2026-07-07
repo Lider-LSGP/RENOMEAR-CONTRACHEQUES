@@ -46,6 +46,23 @@ SUBGROUP_PATTERNS = [
     ('SEDU', 'SEDU'),
 ]
 
+# Mapeia o codi_emp da Domínio para o nome curto usado nas pastas de saída
+CODI_EMP_TO_COMPANY = {
+    '1': 'VSP',
+    '2': 'ATIVA',
+    '3': 'LIDER MULTISSERVICOS',
+    '4': 'LIDER COMERCIAL',
+}
+
+# CNPJ dentro do PDF -> empresa (fonte mais confiável de identificação)
+CNPJ_TO_COMPANY = {
+    '02201230000144': 'ATIVA',            # ATIVA TERCEIRIZACAO DE MAO DE OBRA LTDA
+    '03659631000105': 'LIDER COMERCIAL',  # LIDER LIMPE LIMPEZA COMERCIAL LTDA
+    # Preencha estes dois quando tiver o CNPJ à mão:
+    # '00000000000000': 'LIDER MULTISSERVICOS',
+    # '00000000000000': 'VSP',
+}
+
 
 @dataclass
 class Record:
@@ -53,6 +70,7 @@ class Record:
     new_name: str
     cpf: str
     code: str
+    codi_emp: str
     company: str
     subgroup: str
     period: str
@@ -100,11 +118,25 @@ def detect_company(text: str) -> str:
     return 'NAO_IDENTIFICADA'
 
 
+def detect_company_by_cnpj(text: str) -> str:
+    """Empresa identificada pelo CNPJ dentro do PDF - fonte mais segura."""
+    if not text:
+        return ''
+    for raw in re.findall(r'\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}', text):
+        cleaned = re.sub(r'\D', '', raw)
+        if cleaned in CNPJ_TO_COMPANY:
+            return CNPJ_TO_COMPANY[cleaned]
+    return ''
+
+
 def detect_ativa_subgroup(text: str) -> str:
     upper = normalize_text(text).upper()
-    for pattern, subgroup in NORMALIZED_SUBGROUP_PATTERNS:
-        if pattern in upper:
-            return subgroup
+    # PMV cobre "PMV SEGES", "PMV - SEDUR", "PMV/SEMAS", etc.
+    if 'PMV' in upper or 'PREFEITURA MUNICIPAL DE VITORIA' in upper:
+        return 'PMV'
+    # SEDU cobre "SEDU - EEEFM...", "SEDU/ES", etc.
+    if 'SEDU' in upper:
+        return 'SEDU'
     return 'GERAL'
 
 
@@ -118,26 +150,43 @@ def detect_period_from_text(text: str) -> Optional[str]:
     return None
 
 
+# Padrão de nome de arquivo da Domínio:
+# {codi_emp}-{MM}-{AAAA}-M-{codigo_empregado}-...pdf
+RE_DOMINIO_FILENAME = re.compile(
+    r'^\s*(\d{1,3})-(0?[1-9]|1[0-2])-(20\d{2})-[Mm]-(\d{1,12})(?:[-_].*)?\.pdf$',
+    flags=re.IGNORECASE,
+)
+
+
+def parse_dominio_filename(filename: str) -> Tuple[str, str, str]:
+    """Retorna (codi_emp, período MM-AAAA, código_empregado) ou ('','','')."""
+    name = Path(filename).name
+    match = RE_DOMINIO_FILENAME.match(name)
+    if match:
+        codi_emp = match.group(1)
+        period = f'{match.group(2).zfill(2)}-{match.group(3)}'
+        code = match.group(4)
+        return codi_emp, period, code
+    return '', '', ''
+
+
 def detect_period_from_filename(filename: str) -> Optional[str]:
+    _, period, _ = parse_dominio_filename(filename)
+    if period:
+        return period
     name = Path(filename).name
     match = re.search(r'(?<!\d)(0?[1-9]|1[0-2])[-_](20\d{2})(?!\d)', name)
     if match:
         return f"{match.group(1).zfill(2)}-{match.group(2)}"
-    old_match = re.search(r'\b\d+-([0-1]?\d)-(20\d{2})-', name)
-    if old_match:
-        return f"{old_match.group(1).zfill(2)}-{old_match.group(2)}"
     return None
 
 
 def detect_code_from_filename(filename: str) -> str:
+    _, _, code = parse_dominio_filename(filename)
+    if code:
+        return code
     name = Path(filename).name
-    patterns = [
-        r'-M-(\d+)-',
-        r'-m-(\d+)-',
-        r'-(\d+)-Recibo',
-        r'\b(\d{1,10})\b(?=.*Recibo)',
-    ]
-    for pattern in patterns:
+    for pattern in [r'-M-(\d+)-', r'-m-(\d+)-', r'-(\d+)-Recibo']:
         match = re.search(pattern, name, flags=re.IGNORECASE)
         if match:
             return clean_digits(match.group(1))
@@ -180,16 +229,23 @@ def read_excel_flexible(file_obj_or_path) -> pd.DataFrame:
     return pd.read_excel(file_obj_or_path, engine='openpyxl')
 
 
-def load_employee_map(file_obj_or_path) -> Dict[str, dict]:
+def load_employee_map(file_obj_or_path) -> Dict[Tuple[str, str], dict]:
+    """Retorna dicionário {(codi_emp, codigo_empregado): info}.
+
+    Também guarda um fallback com codi_emp vazio quando não sabemos a empresa
+    do PDF, usando chave ('', codigo). Assim o lookup fica confiável mesmo
+    quando o mesmo código de empregado existe em empresas diferentes.
+    """
     df = read_excel_flexible(file_obj_or_path)
     col_map = {normalize_column(c): c for c in df.columns}
 
     aliases = {
-        'code': ['codigo', 'codigo_empregado', 'i_empregados', 'cod', 'codigo_colaborador'],
+        'code': ['i_empregados', 'codigo', 'codigo_empregado', 'cod', 'codigo_colaborador'],
         'cpf': ['cpf'],
         'situacao': ['situacao', 'status', 'sit'],
         'company': ['cp_nome_emp', 'empresa', 'nome_empresa', 'razao_social'],
         'worksite': ['nome_quebra', 'posto', 'centro_custo', 'cc', 'lotacao'],
+        'codi_emp': ['codi_emp', 'cod_emp', 'codigo_emp', 'codigo_empresa'],
     }
 
     resolved = {}
@@ -200,14 +256,17 @@ def load_employee_map(file_obj_or_path) -> Dict[str, dict]:
                 break
 
     if 'code' not in resolved or 'cpf' not in resolved:
-        raise ValueError('A planilha precisa ter pelo menos código e CPF (ex.: i_empregados/código e cpf).')
+        raise ValueError('A planilha precisa ter pelo menos código do empregado e CPF (ex.: i_empregados e cpf).')
 
-    employee_map: Dict[str, dict] = {}
+    employee_map: Dict[Tuple[str, str], dict] = {}
+    code_only_map: Dict[str, dict] = {}
     for _, row in df.iterrows():
         code = clean_digits(row.get(resolved['code']))
         cpf_digits = clean_digits(row.get(resolved['cpf']))
         if not code or not cpf_digits:
             continue
+
+        codi_emp = clean_digits(row.get(resolved['codi_emp'])) if resolved.get('codi_emp') else ''
 
         situ_raw = row.get(resolved.get('situacao', ''), '') if resolved.get('situacao') else ''
         situ_digits = clean_digits(situ_raw)
@@ -222,21 +281,33 @@ def load_employee_map(file_obj_or_path) -> Dict[str, dict]:
 
         company_raw = str(row.get(resolved.get('company', ''), '') if resolved.get('company') else '')
         worksite_raw = str(row.get(resolved.get('worksite', ''), '') if resolved.get('worksite') else '')
-        company = detect_company(company_raw) if company_raw else 'NAO_IDENTIFICADA'
+
+        # Empresa: prioriza codi_emp (mapa fixo da Domínio); senão usa o texto da planilha
+        company = CODI_EMP_TO_COMPANY.get(codi_emp, '')
+        if not company:
+            company = detect_company(company_raw) if company_raw else 'NAO_IDENTIFICADA'
         subgroup = detect_ativa_subgroup(worksite_raw) if company == 'ATIVA' else ''
 
-        employee_map[code] = {
+        info = {
             'cpf': format_cpf(cpf_digits),
             'status': status,
             'company': company,
             'company_raw': company_raw,
             'worksite_raw': worksite_raw,
             'subgroup': subgroup,
+            'codi_emp': codi_emp,
         }
+        if codi_emp:
+            employee_map[(codi_emp, code)] = info
+        code_only_map.setdefault(code, info)
+
+    # Fallback: se não tiver codi_emp, ainda dá pra achar pelo código sozinho
+    for code, info in code_only_map.items():
+        employee_map.setdefault(('', code), info)
     return employee_map
 
 
-def extract_text_from_pdf_bytes(data: bytes, max_pages: int = 2) -> str:
+def extract_text_from_pdf_bytes(data: bytes, max_pages: int = 1) -> str:
     reader = PdfReader(io.BytesIO(data))
     pages = []
     total = min(max_pages, len(reader.pages))
@@ -259,34 +330,75 @@ def iter_pdf_uploads(uploaded_files: Iterable) -> Iterator[Tuple[str, bytes]]:
             yield name, raw
 
 
-def build_record(filename: str, data: bytes, employee_map: Optional[Dict[str, dict]] = None) -> Record:
+def build_record(
+    filename: str,
+    data: bytes,
+    employee_map: Optional[Dict[Tuple[str, str], dict]] = None,
+) -> Record:
     employee_map = employee_map or {}
-    text = extract_text_from_pdf_bytes(data)
 
-    company_from_pdf = detect_company(text)
-    subgroup_from_pdf = detect_ativa_subgroup(text) if company_from_pdf == 'ATIVA' else ''
+    # 1) Extrai o que dá do NOME do arquivo (rápido, mas nem sempre confiável)
+    codi_emp_file, period_file, code_file = parse_dominio_filename(filename)
+    if not period_file:
+        period_file = detect_period_from_filename(filename) or ''
+    if not code_file:
+        code_file = detect_code_from_filename(filename)
 
-    period_pdf = detect_period_from_text(text)
-    period_file = detect_period_from_filename(filename)
+    # 2) SEMPRE lê o PDF - é a única fonte segura para identificar a empresa correta
+    try:
+        text = extract_text_from_pdf_bytes(data)
+    except Exception:
+        text = ''
+
+    # 3) Empresa: prioridade CNPJ do PDF > nome no PDF > codi_emp do nome do arquivo
+    company_by_cnpj = detect_company_by_cnpj(text)
+    company_by_text = detect_company(text) if text else 'NAO_IDENTIFICADA'
+    company = (
+        company_by_cnpj
+        or (company_by_text if company_by_text != 'NAO_IDENTIFICADA' else '')
+        or CODI_EMP_TO_COMPANY.get(codi_emp_file, 'NAO_IDENTIFICADA')
+    )
+
+    # 4) Lookup na planilha usando o codi_emp da empresa REAL (não a do nome do arquivo)
+    company_to_codi = {v: k for k, v in CODI_EMP_TO_COMPANY.items()}
+    codi_emp_real = company_to_codi.get(company, '') or codi_emp_file
+
+    employee = {}
+    if codi_emp_real and code_file:
+        employee = employee_map.get((codi_emp_real, code_file), {})
+    if not employee and codi_emp_file and codi_emp_file != codi_emp_real and code_file:
+        employee = employee_map.get((codi_emp_file, code_file), {})
+    if not employee and code_file:
+        employee = employee_map.get(('', code_file), {})
+
+    # 5) Subgrupo PMV/SEDU/GERAL para ATIVA, sempre pelo texto do PDF
+    subgroup = ''
+    if company == 'ATIVA':
+        subgroup = detect_ativa_subgroup(text) if text else 'GERAL'
+
+    # 6) Período: prioriza nome do arquivo, senão texto do PDF
+    period_pdf = detect_period_from_text(text) if text else None
     period = period_file or period_pdf or 'SEM_PERIODO'
 
-    code = detect_code_from_text(text) or detect_code_from_filename(filename)
-    cpf_pdf = detect_cpf_from_text(text)
-
-    employee = employee_map.get(code, {}) if code else {}
-    status = employee.get('status', 'Nao informado')
-    company = employee.get('company') or company_from_pdf
-    subgroup = employee.get('subgroup') or subgroup_from_pdf
+    # 7) CPF: prioriza planilha (mais confiável), senão tenta do PDF
+    cpf_pdf = detect_cpf_from_text(text) if text else ''
     cpf = employee.get('cpf') or cpf_pdf
 
-        included = True
-    reason = 'OK'
+    status = employee.get('status', 'Nao informado')
 
+    # 8) Decide inclusão. Demitidos (situação 8) também são renomeados agora.
+    included = True
+    reason = 'OK'
     if status == 'Demitido':
         reason = 'Situação 8 (Demitido) - renomeado normalmente'
     if not cpf:
         included = False
-        reason = 'CPF não encontrado no PDF nem na planilha'
+        if code_file and employee_map and not employee:
+            reason = f'Código {code_file} (empresa {codi_emp_real or "?"}) não encontrado na planilha'
+        elif not code_file:
+            reason = 'Código do colaborador não identificado no nome do arquivo'
+        else:
+            reason = 'CPF não encontrado no PDF nem na planilha'
     elif period == 'SEM_PERIODO':
         included = False
         reason = 'Período não identificado'
@@ -305,14 +417,15 @@ def build_record(filename: str, data: bytes, employee_map: Optional[Dict[str, di
         original_file=filename,
         new_name=new_name,
         cpf=cpf,
-        code=code,
+        code=code_file,
+        codi_emp=codi_emp_real or codi_emp_file,
         company=company,
         subgroup=subgroup,
         period=period,
         status=status,
         included=included,
         reason=reason,
-        source_company=company_from_pdf,
+        source_company=company_by_cnpj or company_by_text,
         source_period=source_period,
         source_cpf=source_cpf,
     )
@@ -329,7 +442,8 @@ def unique_period_label(records: List[Record]) -> str:
 
 def _write_report_files(zf: zipfile.ZipFile, records: List[Record], errors: List[str]) -> None:
     fieldnames = list(asdict(records[0]).keys()) if records else [
-        'original_file', 'new_name', 'cpf', 'code', 'company', 'subgroup', 'period', 'status', 'included', 'reason', 'source_company', 'source_period', 'source_cpf'
+        'original_file', 'new_name', 'cpf', 'code', 'codi_emp', 'company', 'subgroup',
+        'period', 'status', 'included', 'reason', 'source_company', 'source_period', 'source_cpf'
     ]
     csv_buffer = io.StringIO()
     writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
@@ -359,7 +473,7 @@ def _write_report_files(zf: zipfile.ZipFile, records: List[Record], errors: List
 
 def create_output_zips(
     pdf_items: Iterable[Tuple[str, bytes]],
-    employee_map: Optional[Dict[str, dict]] = None,
+    employee_map: Optional[Dict[Tuple[str, str], dict]] = None,
     make_separate_zip: bool = True,
     make_general_zip: bool = True,
 ) -> Tuple[Optional[bytes], Optional[bytes], List[Record]]:
@@ -372,8 +486,8 @@ def create_output_zips(
     used_separate = set()
     used_combined = set()
 
-    zsep = zipfile.ZipFile(separate_buffer, 'w', compression=zipfile.ZIP_DEFLATED) if separate_buffer else None
-    zall = zipfile.ZipFile(combined_buffer, 'w', compression=zipfile.ZIP_DEFLATED) if combined_buffer else None
+    zsep = zipfile.ZipFile(separate_buffer, 'w', compression=zipfile.ZIP_STORED) if separate_buffer else None
+    zall = zipfile.ZipFile(combined_buffer, 'w', compression=zipfile.ZIP_STORED) if combined_buffer else None
 
     try:
         for filename, data in pdf_items:
@@ -412,6 +526,7 @@ def create_output_zips(
                     new_name=filename,
                     cpf='',
                     code='',
+                    codi_emp='',
                     company='NAO_IDENTIFICADA',
                     subgroup='',
                     period='SEM_PERIODO',
@@ -448,6 +563,7 @@ def summarize_records(records: List[Record]) -> dict:
     company_counter = Counter(r.company for r in included)
     subgroup_counter = Counter((r.subgroup or 'GERAL') for r in included if r.company == 'ATIVA')
     source_cpf_counter = Counter(r.source_cpf for r in records)
+    demitidos = sum(1 for r in records if r.status == 'Demitido')
     return {
         'total': len(records),
         'incluidos': len(included),
@@ -456,4 +572,5 @@ def summarize_records(records: List[Record]) -> dict:
         'ativa_subgrupos': dict(subgroup_counter),
         'periodo': unique_period_label(records),
         'cpf_por_origem': dict(source_cpf_counter),
+        'demitidos_renomeados': demitidos,
     }
